@@ -1,0 +1,16 @@
+__pycache__
+*.pyc
+*.log
+*.png
+*.jpg
+*.jpeg
+*.pkl
+*.pth
+*.pt
+*.csv
+nemotron*
+img_prompts*
+annotations
+train2017*
+*_processed
+*_features
