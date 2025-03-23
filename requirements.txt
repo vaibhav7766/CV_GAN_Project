@@ -3,3 +3,6 @@ torchvision
 torchaudio
 transformers
 Pillow
+argparse
+pyttsx3
+picamera2
