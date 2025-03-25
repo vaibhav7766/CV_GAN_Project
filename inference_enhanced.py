@@ -1,27 +1,32 @@
 import torch
 from torch import nn
-from torchvision import transforms, models
-from torchvision.models import MobileNet_V3_Large_Weights
+from torchvision import  models
+from torchvision.models import EfficientNet_B4_Weights
 from transformers import AutoTokenizer
 from PIL import Image
 import math
+import time
 
 
 # --- Encoder ---
-class MobileNetV3Encoder(nn.Module):
+class EfficientNetEncoder(nn.Module):
     def __init__(self):
-        super(MobileNetV3Encoder, self).__init__()
-        mobilenet = models.mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.IMAGENET1K_V1)
-        # Use the convolutional features only
-        self.features = mobilenet.features
-    
+        super(EfficientNetEncoder, self).__init__()
+        # Load pretrained EfficientNet-B4 model
+        efficientnet = models.efficientnet_b4(weights=EfficientNet_B4_Weights.IMAGENET1K_V1)
+        # Use the convolutional features (exclude the classification head)
+        self.features = efficientnet.features  
+        # Optionally, add adaptive pooling to get fixed spatial dimensions
+        self.pool = nn.AdaptiveAvgPool2d((7, 7))
+        
     def forward(self, images):
         features = self.features(images)  # shape: (batch, C, H, W)
+        features = self.pool(features)      # shape: (batch, C, 7, 7)
         batch, C, H, W = features.shape
         # Flatten spatial dimensions: each image becomes a sequence of (H*W) tokens
-        features = features.view(batch, C, H * W)  # (batch, C, H*W)
-        features = features.transpose(1, 2)        # (batch, H*W, C)
-        return features  # e.g., (batch, 49, 960) for a 7x7 feature map
+        features = features.view(batch, C, H * W)  # (batch, C, 49)
+        features = features.transpose(1, 2)        # (batch, 49, C)
+        return features  # e.g., (batch, 49, feature_dim)
 
 
 # --- Decoder with Spatial Attention and Teacher Forcing ---
@@ -36,35 +41,42 @@ class TransformerDecoder(nn.Module):
             num_layers: Number of transformer decoder layers.
             max_length: Maximum length for target sequences.
             feature_dim: Dimension of encoder output channels.
-            num_image_tokens: Number of spatial tokens from the encoder (e.g., 7x7=49).
             dropout: Dropout rate.
+            num_image_tokens: Number of spatial tokens from the encoder (e.g., 7x7=49).
         """
         super(TransformerDecoder, self).__init__()
         self.embed_dim = embed_dim
         self.max_length = max_length
         
-        # Embedding layer for target tokens.
+        # Token embedding for target captions.
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.dropout = nn.Dropout(dropout)
-        
-        # Sinusoidal positional encoding for target tokens.
         self.register_buffer('positional_encoding', self._generate_positional_encoding(max_length, embed_dim))
         
-        # Project encoder's spatial features to the decoder embedding space.
-        self.feature_proj = nn.Linear(feature_dim, embed_dim)
+        # Project encoder's spatial features to decoder embedding space.
+        self.feature_proj = nn.Sequential(
+            nn.Linear(feature_dim, embed_dim),
+            nn.LayerNorm(embed_dim)  # Normalize features for stability
+        )
         
-        # Learnable positional embedding for image spatial tokens.
+        # Learnable positional embeddings for image tokens.
         self.image_pos_embedding = nn.Parameter(torch.randn(1, num_image_tokens, embed_dim))
         
-        # Transformer decoder (batch_first=True).
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=embed_dim, nhead=num_heads, dim_feedforward=hidden_dim, dropout=dropout, batch_first=True
-        )
+        # Extra Transformer encoder block for image features
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=hidden_dim, dropout=dropout, batch_first=True)
+        self.image_feature_encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        
+        # Transformer decoder layers.
+        decoder_layer = nn.TransformerDecoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=hidden_dim, dropout=dropout, batch_first=True)
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         
-        # Final linear layer to map decoder outputs to vocabulary logits.
+        # Final output projection.
         self.fc_out = nn.Linear(embed_dim, vocab_size)
-    
+
+        # Final layer norm for stability
+        self.layer_norm = nn.LayerNorm(embed_dim)
+
+
     def _generate_positional_encoding(self, max_len, d_model):
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
@@ -88,24 +100,25 @@ class TransformerDecoder(nn.Module):
         Returns:
             Logits for each target token, shape (batch, tgt_seq_len, vocab_size).
         """
-        # Project and add learnable positional embedding to the image features.
-        memory = self.feature_proj(encoder_features) + self.image_pos_embedding # (batch, num_image_tokens, embed_dim)
-       
-        # Embed target tokens and add sinusoidal positional encoding.
+        # Project encoder features and add image positional embeddings.
+        memory = self.feature_proj(encoder_features) + self.image_pos_embedding  # (batch, num_image_tokens, embed_dim)
+        # Process image features through an extra encoder block.
+        memory = self.image_feature_encoder(memory)
+        
+        # Embed target tokens and add positional encoding.
         tgt_embedded = self.embedding(tgt_input) * math.sqrt(self.embed_dim)
         seq_len = tgt_input.size(1)
         pos_enc = self.positional_encoding[:, :seq_len, :].to(tgt_input.device)
         tgt_embedded = tgt_embedded + pos_enc
         tgt_embedded = self.dropout(tgt_embedded)
         
-        # Generate causal mask if not provided.
+        # Create causal mask if needed.
         if tgt_mask is None:
             tgt_mask = self.generate_square_subsequent_mask(seq_len).to(tgt_input.device)
         
-        # Transformer decoder processing.
-        decoder_output = self.transformer_decoder(
-            tgt_embedded, memory, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask
-        )
+        # Pass through Transformer decoder.
+        decoder_output = self.transformer_decoder(tgt_embedded, memory, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
+        decoder_output = self.layer_norm(decoder_output)
         logits = self.fc_out(decoder_output)
         return logits
 
@@ -129,7 +142,13 @@ class ImageCaptionModel(nn.Module):
 
 
 # --- Inference function ---
-def top_k_sampling_decode(encoder_features, model, tokenizer, device, max_length, k=50):
+def process_time(func, *args):
+    st = time.time()
+    output = func(*args)
+    et = time.time()
+    return output, et - st
+
+def top_k_sampling_decode(encoder_features, model, tokenizer, device, max_length, k=10):
     start_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.pad_token_id
     eos_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.pad_token_id
     
@@ -215,21 +234,17 @@ def beam_search_decode(encoder_features, model, tokenizer, device, max_length, b
     return caption
 
 def generate_caption_for_image(image_path, model, tokenizer, device, max_length):
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
+    weights = EfficientNet_B4_Weights.IMAGENET1K_V1
+    transform = weights.transforms()
     image = Image.open(image_path).convert("RGB")
     image = transform(image).unsqueeze(0).to(device)
 
     model.eval()
     with torch.no_grad():
         encoder_features = model.encoder(image)
-        caption1 = top_k_sampling_decode(encoder_features, model, tokenizer, device, max_length=max_length)
-        caption2 = nucleus_sampling_decode(encoder_features, model, tokenizer, device, max_length=max_length)
-        caption3 = beam_search_decode(encoder_features, model, tokenizer, device, max_length=max_length)
+        caption1 = process_time(top_k_sampling_decode, encoder_features, model, tokenizer, device, max_length)
+        caption2 = process_time(nucleus_sampling_decode, encoder_features, model, tokenizer, device, max_length)
+        caption3 = process_time(beam_search_decode, encoder_features, model, tokenizer, device, max_length)
     return caption1, caption2, caption3
 
 def inference():
@@ -237,12 +252,12 @@ def inference():
     MODEL_CHECKPOINT = "best_model.pth"
     MAX_LENGTH = 50
 
-    embed_dim = 256
+    embed_dim = 512
     num_heads = 8
-    hidden_dim = 1024
-    num_layers = 4
-    dropout = 0.3
-    feature_dim = 960
+    hidden_dim = 2048
+    num_layers = 6
+    dropout = 0.2
+    feature_dim = 1792
     
     device = "cpu"
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
@@ -251,7 +266,7 @@ def inference():
     tokenizer.bos_token_id = tokenizer.convert_tokens_to_ids("[CLS]")
     tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids("[SEP]")
 
-    encoder = MobileNetV3Encoder()
+    encoder = EfficientNetEncoder()
     decoder = TransformerDecoder(
         embed_dim=embed_dim,
         num_heads=num_heads,
@@ -268,9 +283,9 @@ def inference():
     print("Loaded model from", MODEL_CHECKPOINT)
 
     caption1, caption2, caption3 = generate_caption_for_image(IMAGE_PATH, model, tokenizer, device, MAX_LENGTH)
-    print("Generated Caption (top-k):", caption1)
-    print("Generated Caption (nucleus):", caption2)
-    print("Generated Caption (beam):", caption3)
+    print(f"Top-k ({caption1[1]:.2f}s): {caption1[0]}")
+    print(f"Nucleus ({caption2[1]:.2f}s): {caption2[0]}")
+    print(f"Beam ({caption3[1]:.2f}s): {caption3[0]}")
 
 
 if __name__ == "__main__":
