@@ -195,6 +195,7 @@ def nucleus_sampling_decode(encoder_features, model, tokenizer, device, max_leng
     caption = tokenizer.decode(generated.squeeze(), skip_special_tokens=True)
     return caption
 
+# rp 1.5
 def beam_search_decode(encoder_features, model, tokenizer, device, max_length, beam_width=3, length_penalty=0.7, repetition_penalty=1.2):
     start_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.pad_token_id
     eos_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.pad_token_id
@@ -248,7 +249,7 @@ def generate_caption_for_image(image_path, model, tokenizer, device, max_length)
     return caption1, caption2, caption3
 
 def inference():
-    IMAGE_PATH = input("Enter image path: ")
+    IMAGE_PATH = "train2017_50k/000000391895.jpg"
     MODEL_CHECKPOINT = "best_model.pth"
     MAX_LENGTH = 50
 
