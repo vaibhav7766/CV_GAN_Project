@@ -8,17 +8,70 @@ from torch import nn, optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms, models
-from torchvision.models import MobileNet_V3_Large_Weights
-from transformers import AutoTokenizer
+from torchvision.models import EfficientNet_B4_Weights
+from transformers import BartTokenizer
 from PIL import Image
 from tqdm import tqdm
 import math
+import timm
 from nltk.translate.bleu_score import corpus_bleu
 from nltk.translate.meteor_score import meteor_score
 from torchmetrics.text import ROUGEScore, BERTScore
 from pycocoevalcap.cider.cider import Cider
 
 
+# --- Dataset ---
+class CaptionDataset(Dataset):
+    def __init__(self, image_dir, captions_file, tokenizer, max_length,
+                use_features=False, features_dir=None):
+        self.image_dir = image_dir
+        self.data = []
+        with open(captions_file, 'r') as f:
+            data = json.load(f)
+        for img_name, captions in data.items():
+            for cap in captions:
+                self.data.append((img_name, cap)) 
+        
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.use_features = use_features
+        self.features_dir = features_dir
+        if features_dir is None:
+            self.use_features = False
+        
+        # Transformation is only used when loading raw images.
+        weights = EfficientNet_B4_Weights.IMAGENET1K_V1
+        self.transform = weights.transforms()
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        image_filename, caption = self.data[idx]
+        tokenized = self.tokenizer(
+            caption,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+        tokenized_caption = {
+            "input_ids": tokenized.input_ids.squeeze(), 
+            "attention_mask": tokenized.attention_mask.squeeze()
+        }
+        
+        if self.use_features:
+            feature_path = os.path.join(self.features_dir, os.path.splitext(image_filename)[0] + ".pt")
+            features = torch.load(feature_path, weights_only=True)
+            return features, tokenized_caption["input_ids"], tokenized_caption["attention_mask"]
+        else:
+            image_path = os.path.join(self.image_dir, image_filename)
+            image = Image.open(image_path).convert("RGB")
+            image = self.transform(image)
+            return image, tokenized_caption["input_ids"], tokenized_caption["attention_mask"]
+
+
+# --- Merged Dataset ---
 class ImageCaptionDataset(Dataset):
     def __init__(self, image_dir, captions_file, tokenizer, max_length,
                 use_features=False, features_dir=None):
@@ -35,12 +88,8 @@ class ImageCaptionDataset(Dataset):
             self.use_features = False
         
         # Transformation is only used when loading raw images.
-        self.transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                 std=[0.229, 0.224, 0.225])
-        ])
+        weights = EfficientNet_B4_Weights.IMAGENET1K_V1
+        self.transform = weights.transforms()
 
     def __len__(self):
         return len(self.image_filenames)
@@ -70,25 +119,44 @@ class ImageCaptionDataset(Dataset):
             image = self.transform(image)
             return image, tokenized_caption["input_ids"], tokenized_caption["attention_mask"]
 
-# --- Encoder ---
-class MobileNetV3Encoder(nn.Module):
+
+# --- EfficientNetB4 Encoder ---
+class EfficientNetEncoder(nn.Module):
     def __init__(self):
-        super(MobileNetV3Encoder, self).__init__()
-        mobilenet = models.mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.IMAGENET1K_V1)
-        # Use the convolutional features only
-        self.features = mobilenet.features
-    
+        super(EfficientNetEncoder, self).__init__()
+        # Load pretrained EfficientNet-B4 model
+        efficientnet = models.efficientnet_b4(weights=EfficientNet_B4_Weights.IMAGENET1K_V1)
+        # Use the convolutional features (exclude the classification head)
+        self.features = efficientnet.features  
+        # Optionally, add adaptive pooling to get fixed spatial dimensions
+        self.pool = nn.AdaptiveAvgPool2d((7, 7))
+        
     def forward(self, images):
         features = self.features(images)  # shape: (batch, C, H, W)
+        features = self.pool(features)      # shape: (batch, C, 7, 7)
         batch, C, H, W = features.shape
         # Flatten spatial dimensions: each image becomes a sequence of (H*W) tokens
-        features = features.view(batch, C, H * W)  # (batch, C, H*W)
-        features = features.transpose(1, 2)        # (batch, H*W, C)
-        return features  # e.g., (batch, 49, 960) for a 7x7 feature map
+        features = features.view(batch, C, H * W)  # (batch, C, 49)
+        features = features.transpose(1, 2)        # (batch, 49, C)
+        return features  # e.g., (batch, 49, feature_dim)
+
+
+# --- DeiT Encoder ---
+class DeiTEncoder(nn.Module):
+    def __init__(self):
+        super(DeiTEncoder, self).__init__()
+        self.deit = timm.create_model("deit_base_patch16_224", pretrained=True)
+        self.embed_dim = self.deit.embed_dim
+        self.deit.reset_classifier(0)  # Remove classification head
+
+    def forward(self, images):
+        features = self.deit.forward_features(images)  # (batch, 1+num_patches, embed_dim)
+        return features  # Keep class token (global context)
+
 
 # --- Decoder with Spatial Attention and Teacher Forcing ---
 class TransformerDecoder(nn.Module):
-    def __init__(self, embed_dim, num_heads, hidden_dim, vocab_size, num_layers, max_length, feature_dim, dropout, num_image_tokens=49):
+    def __init__(self, embed_dim, num_heads, hidden_dim, vocab_size, num_layers, max_length, feature_dim, dropout, num_image_tokens):
         """
         Args:
             embed_dim: Embedding dimension for target tokens.
@@ -98,35 +166,42 @@ class TransformerDecoder(nn.Module):
             num_layers: Number of transformer decoder layers.
             max_length: Maximum length for target sequences.
             feature_dim: Dimension of encoder output channels.
-            num_image_tokens: Number of spatial tokens from the encoder (e.g., 7x7=49).
             dropout: Dropout rate.
+            num_image_tokens: Number of spatial tokens from the encoder (e.g., 7x7=49).
         """
         super(TransformerDecoder, self).__init__()
         self.embed_dim = embed_dim
         self.max_length = max_length
         
-        # Embedding layer for target tokens.
+        # Token embedding for target captions.
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.dropout = nn.Dropout(dropout)
-        
-        # Sinusoidal positional encoding for target tokens.
         self.register_buffer('positional_encoding', self._generate_positional_encoding(max_length, embed_dim))
         
-        # Project encoder's spatial features to the decoder embedding space.
-        self.feature_proj = nn.Linear(feature_dim, embed_dim)
+        # Project encoder's spatial features to decoder embedding space.
+        self.feature_proj = nn.Sequential(
+            nn.Linear(feature_dim, embed_dim),
+            nn.LayerNorm(embed_dim)  # Normalize features for stability
+        )
         
-        # Learnable positional embedding for image spatial tokens.
+        # Learnable positional embeddings for image tokens.
         self.image_pos_embedding = nn.Parameter(torch.randn(1, num_image_tokens, embed_dim))
         
-        # Transformer decoder (batch_first=True).
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=embed_dim, nhead=num_heads, dim_feedforward=hidden_dim, dropout=dropout, batch_first=True
-        )
+        # Extra Transformer encoder block for image features
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=hidden_dim, dropout=dropout, batch_first=True)
+        self.image_feature_encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        
+        # Transformer decoder layers.
+        decoder_layer = nn.TransformerDecoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=hidden_dim, dropout=dropout, batch_first=True)
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         
-        # Final linear layer to map decoder outputs to vocabulary logits.
+        # Final output projection.
         self.fc_out = nn.Linear(embed_dim, vocab_size)
-    
+
+        # Final layer norm for stability
+        self.layer_norm = nn.LayerNorm(embed_dim)
+
+
     def _generate_positional_encoding(self, max_len, d_model):
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
@@ -150,24 +225,25 @@ class TransformerDecoder(nn.Module):
         Returns:
             Logits for each target token, shape (batch, tgt_seq_len, vocab_size).
         """
-        # Project and add learnable positional embedding to the image features.
-        memory = self.feature_proj(encoder_features) + self.image_pos_embedding # (batch, num_image_tokens, embed_dim)
-       
-        # Embed target tokens and add sinusoidal positional encoding.
+        # Project encoder features and add image positional embeddings.
+        memory = self.feature_proj(encoder_features) + self.image_pos_embedding  # (batch, num_image_tokens, embed_dim)
+        # Process image features through an extra encoder block.
+        memory = self.image_feature_encoder(memory)
+        
+        # Embed target tokens and add positional encoding.
         tgt_embedded = self.embedding(tgt_input) * math.sqrt(self.embed_dim)
         seq_len = tgt_input.size(1)
         pos_enc = self.positional_encoding[:, :seq_len, :].to(tgt_input.device)
         tgt_embedded = tgt_embedded + pos_enc
         tgt_embedded = self.dropout(tgt_embedded)
         
-        # Generate causal mask if not provided.
+        # Create causal mask if needed.
         if tgt_mask is None:
             tgt_mask = self.generate_square_subsequent_mask(seq_len).to(tgt_input.device)
         
-        # Transformer decoder processing.
-        decoder_output = self.transformer_decoder(
-            tgt_embedded, memory, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask
-        )
+        # Pass through Transformer decoder.
+        decoder_output = self.transformer_decoder(tgt_embedded, memory, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
+        decoder_output = self.layer_norm(decoder_output)
         logits = self.fc_out(decoder_output)
         return logits
 
@@ -338,7 +414,7 @@ class ImageCaptionTrainer:
                     print("Early stopping triggered!")
                     break
 
-    def _batched_generate_caption(self, images, max_length):
+    def greedy_search_decode(self, images, max_length):
         """Generates captions for a batch of images using greedy decoding."""
         self.model.eval()
         with torch.no_grad():
@@ -423,7 +499,7 @@ class ImageCaptionTrainer:
         best_sequence = beams[0][0]
         return best_sequence
 
-    def batched_generate_caption(self, images, max_length, beam_width=3, length_penalty=0.7, repetition_penalty=1.2):
+    def batched_beam_search_decode(self, images, max_length, beam_width=3, length_penalty=0.7, repetition_penalty=1.2):
         """
         Generates captions for a batch of images using beam search decoding.
         
@@ -479,7 +555,7 @@ class ImageCaptionTrainer:
         
         with torch.no_grad():
             for images, input_ids, attention_mask in tqdm(test_loader, desc="Testing"):
-                batch_generated = self._batched_generate_caption(images, max_length)
+                batch_generated = self.batched_beam_search_decode(images, max_length)
                 for i in range(images.size(0)):
                     hypothesis = self.tokenizer.decode(batch_generated[i], skip_special_tokens=True)
                     reference = self.tokenizer.decode(input_ids[i], skip_special_tokens=True)
@@ -488,6 +564,9 @@ class ImageCaptionTrainer:
                     bleu_hypotheses.append(hypothesis.split())
                     bleu_references.append([reference.split()])
         
+        return all_hypotheses, all_references, bleu_hypotheses, bleu_references
+
+    def compute_metrics(self, all_hypotheses, all_references, bleu_hypotheses, bleu_references):
         # Compute BLEU
         print("Computing BLEU Score...", end=" ")
         bleu_score = self.bleu(bleu_references, bleu_hypotheses)
@@ -532,7 +611,7 @@ def precompute_features(dataset, encoder, device, save_dir, batch_size=32):
     encoder.eval()
     encoder.to(device)
     os.makedirs(save_dir, exist_ok=True)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, pin_memory=True, persistent_workers=True, num_workers=4)
     idx = 0
     with torch.no_grad():
         for images, _, _ in tqdm(loader, desc="Precomputing features"):
@@ -545,76 +624,6 @@ def precompute_features(dataset, encoder, device, save_dir, batch_size=32):
                 torch.save(feature.cpu(), feature_path)
                 idx += 1
 
-
-def train():
-    # --- Paths, Tokenizer, Dataset, and DataLoader ---
-    IMAGE_DIR = "train2017_50k"
-    FEATURES_DIR = "train2017_50k_features"
-    CAPTIONS_FILE = "merged_captions.json"
-    max_length = 30
-    batch_size = 32
-    tokenizer = AutoTokenizer.from_pretrained("nemotron_tokenizer")
-    dataset = ImageCaptionDataset(IMAGE_DIR, CAPTIONS_FILE, tokenizer, max_length=max_length, use_features=True, features_dir=FEATURES_DIR)
-
-    # --- Create Train, Validation, and Test Splits ---
-    total_size = len(dataset)
-    train_size = int(0.7 * total_size)
-    val_size = int(0.15 * total_size)
-    test_size = total_size - train_size - val_size
-    train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    # --- Device Setup ---
-    device = torch.device("xpu" if torch.xpu.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
-
-    # --- Hyperparameters ---
-    embed_dim = 128
-    num_heads = 4
-    hidden_dim = 128
-    num_layers = 2
-    dropout = 0.2
-    feature_dim = 960
-
-    # --- Instantiate Encoder, Decoder, and Model ---
-    encoder = MobileNetV3Encoder()
-    decoder = TransformerDecoder(
-        embed_dim=embed_dim,        
-        num_heads=num_heads,      
-        hidden_dim=hidden_dim,
-        vocab_size=tokenizer.vocab_size,
-        num_layers=num_layers,    
-        max_length=max_length,
-        feature_dim=feature_dim,
-        dropout=dropout
-    )
-    model = ImageCaptionModel(encoder, decoder)
-
-    # --- Loss, Optimizer, and Training ---
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
-
-    num_epochs = 50
-    scheduler = ReduceLROnPlateau(optimizer)
-
-    model.train()
-    model = model.to(device)
-    criterion = criterion.to(device)
-    model, optimizer = ipex.optimize(model, optimizer=optimizer)
-
-    trainer = ImageCaptionTrainer(model, tokenizer, criterion, optimizer, scheduler, device)
-    trainer.train(train_loader, val_loader, num_epochs, patience=10, min_delta=0.001)
-
-    # --- After Training, Evaluate on the Test Set ---
-    bleu_score = trainer.evaluate_test_set(test_loader, max_length)
-    print("Test BLEU score: {:.4f}".format(bleu_score))
-
-    # --- Load best model then check bleu score ---
-    model.load_state_dict(torch.load("best_model.pth", weights_only=True))
-    trainer.model = model
-    bleu_score = trainer.evaluate_test_set(test_loader, max_length)
-    print("Test BLEU score: {:.4f}".format(bleu_score))
 
 # --- Inference function ---
 def top_k_sampling_decode(encoder_features, model, tokenizer, device, max_length, k=50):
@@ -702,40 +711,49 @@ def beam_search_decode(encoder_features, model, tokenizer, device, max_length, b
     caption = tokenizer.decode(best_sequence, skip_special_tokens=True)
     return caption
 
-def generate_caption_for_image(image_path, model, tokenizer, device, max_length):
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])
-    ])
-    image = Image.open(image_path).convert("RGB")
-    image = transform(image).unsqueeze(0).to(device)
 
+def process_image(image_path, model_name):
+    if model_name == "efficientnet":
+        weights = EfficientNet_B4_Weights.IMAGENET1K_V1
+        transform = weights.transforms()
+    elif model_name == "deit":
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+    image = Image.open(image_path).convert("RGB")
+    image = transform(image).unsqueeze(0)
+    return image
+
+def generate_caption(image_path, model, model_name, tokenizer, device, max_length):
+    image = process_image(image_path, model_name)
+    image = image.to(device)
     model.eval()
     with torch.no_grad():
         encoder_features = model.encoder(image)
-        caption1 = top_k_sampling_decode(encoder_features, model, tokenizer, device, max_length=max_length)
-        caption2 = nucleus_sampling_decode(encoder_features, model, tokenizer, device, max_length=max_length)
-        caption3 = beam_search_decode(encoder_features, model, tokenizer, device, max_length=max_length)
-    return caption1, caption2, caption3
+        caption = beam_search_decode(encoder_features, model, tokenizer, device, max_length=max_length)
+    return caption
 
-def inference():
-    IMAGE_PATH = input("Enter image path: ")
-    MODEL_CHECKPOINT = "best_model.pth"
-    MAX_LENGTH = 30
+def inference_efficientnet():
+    MODEL_CHECKPOINT = "best_model_efficientnet.pth"
+    MAX_LENGTH = 100
 
-    embed_dim = 128
+    embed_dim = 256
     num_heads = 4
-    hidden_dim = 128
-    num_layers = 2
+    hidden_dim = 1024
+    num_layers = 4
     dropout = 0.2
-    feature_dim = 960
+    feature_dim = 1792
+    num_image_tokens = 49
     
     device = "cpu"
-    tokenizer = AutoTokenizer.from_pretrained("nemotron_tokenizer")
+    tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
 
-    encoder = MobileNetV3Encoder()
+    encoder = EfficientNetEncoder()
     decoder = TransformerDecoder(
         embed_dim=embed_dim,
         num_heads=num_heads,
@@ -744,6 +762,43 @@ def inference():
         num_layers=num_layers,
         max_length=MAX_LENGTH,
         feature_dim=feature_dim,
+        num_image_tokens=num_image_tokens,
+        dropout=dropout
+    )
+    model = ImageCaptionModel(encoder, decoder)
+
+    model.load_state_dict(torch.load(MODEL_CHECKPOINT, weights_only=True))
+    print("Loaded model from", MODEL_CHECKPOINT)
+    while True:
+        IMAGE_PATH = input("Enter image path: ")
+        caption = generate_caption(IMAGE_PATH, model,"efficientnet", tokenizer, device, MAX_LENGTH)
+        print("Generated Caption (beam):", caption)
+
+def inference_deit():
+    MODEL_CHECKPOINT = "best_model_deit.pth"
+    MAX_LENGTH = 100
+
+    embed_dim = 256
+    num_heads = 4
+    hidden_dim = 1024
+    num_layers = 4
+    dropout = 0.2
+    feature_dim = 768
+    num_image_tokens = 196
+    
+    device = "cpu"
+    tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
+
+    encoder = DeiTEncoder()
+    decoder = TransformerDecoder(
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        hidden_dim=hidden_dim,
+        vocab_size=tokenizer.vocab_size,
+        num_layers=num_layers,
+        max_length=MAX_LENGTH,
+        feature_dim=feature_dim,
+        num_image_tokens=num_image_tokens,
         dropout=dropout
     )
     model = ImageCaptionModel(encoder, decoder)
@@ -751,11 +806,29 @@ def inference():
     model.load_state_dict(torch.load(MODEL_CHECKPOINT, weights_only=True))
     print("Loaded model from", MODEL_CHECKPOINT)
 
-    caption = generate_caption_for_image(IMAGE_PATH, model, tokenizer, device, MAX_LENGTH)
-    print("Generated Caption 1 (top-k):", caption[0])
-    print("Generated Caption 2 (nucleus):", caption[1])
-    print("Generated Caption 3 (beam):", caption[2])
+    while True:
+        IMAGE_PATH = input("Enter image path: ")
+        caption = generate_caption(IMAGE_PATH, model, "deit", tokenizer, device, MAX_LENGTH)
+        print("Generated Caption (beam):", caption)
 
+def inference():
+    while True:
+        try:
+            model_id = input("Enter model name (1: efficientnet, 2: deit): ").strip().lower()
+            model_id = int(model_id)
+        except ValueError:
+            print("Invalid input. Please enter 1 or 2.")
+            continue
+
+        if model_id == 1:
+            inference_efficientnet()
+            break
+        elif model_id == 2:
+            inference_deit()
+            break
+        else:
+            print("Invalid input. Please enter 1 or 2.")
+            continue
 
 if __name__ == "__main__":
     inference()
