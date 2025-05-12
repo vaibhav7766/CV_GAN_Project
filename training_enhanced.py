@@ -9,7 +9,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms, models
 from torchvision.models import EfficientNet_B4_Weights
-from transformers import AutoTokenizer, BartTokenizer
+from transformers import BartTokenizer
 from PIL import Image
 from tqdm import tqdm
 import math
@@ -17,6 +17,56 @@ from nltk.translate.bleu_score import corpus_bleu
 from nltk.translate.meteor_score import meteor_score
 from torchmetrics.text import ROUGEScore, BERTScore
 from pycocoevalcap.cider.cider import Cider
+
+
+class CaptionDataset(Dataset):
+    def __init__(self, image_dir, captions_file, tokenizer, max_length,
+                use_features=False, features_dir=None):
+        self.image_dir = image_dir
+        self.data = []
+        with open(captions_file, 'r') as f:
+            data = json.load(f)
+        for img_name, captions in data.items():
+            for cap in captions:
+                self.data.append((img_name, cap)) 
+        
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.use_features = use_features
+        self.features_dir = features_dir
+        if features_dir is None:
+            self.use_features = False
+        
+        # Transformation is only used when loading raw images.
+        weights = EfficientNet_B4_Weights.IMAGENET1K_V1
+        self.transform = weights.transforms()
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        image_filename, caption = self.data[idx]
+        tokenized = self.tokenizer(
+            caption,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+        tokenized_caption = {
+            "input_ids": tokenized.input_ids.squeeze(), 
+            "attention_mask": tokenized.attention_mask.squeeze()
+        }
+        
+        if self.use_features:
+            feature_path = os.path.join(self.features_dir, os.path.splitext(image_filename)[0] + ".pt")
+            features = torch.load(feature_path, weights_only=True)
+            return features, tokenized_caption["input_ids"], tokenized_caption["attention_mask"]
+        else:
+            image_path = os.path.join(self.image_dir, image_filename)
+            image = Image.open(image_path).convert("RGB")
+            image = self.transform(image)
+            return image, tokenized_caption["input_ids"], tokenized_caption["attention_mask"]
 
 
 class ImageCaptionDataset(Dataset):
@@ -65,6 +115,7 @@ class ImageCaptionDataset(Dataset):
             image = Image.open(image_path).convert("RGB")
             image = self.transform(image)
             return image, tokenized_caption["input_ids"], tokenized_caption["attention_mask"]
+
 
 # --- Encoder ---
 class EfficientNetEncoder(nn.Module):
@@ -653,13 +704,11 @@ def generate_caption_for_image(image_path, model, tokenizer, device, max_length)
     model.eval()
     with torch.no_grad():
         encoder_features = model.encoder(image)
-        # caption1 = top_k_sampling_decode(encoder_features, model, tokenizer, device, max_length=max_length)
-        # caption2 = nucleus_sampling_decode(encoder_features, model, tokenizer, device, max_length=max_length)
-        caption3 = beam_search_decode(encoder_features, model, tokenizer, device, max_length=max_length)
-    return "caption1", "caption2", caption3
+        caption = beam_search_decode(encoder_features, model, tokenizer, device, max_length=max_length)
+    return caption
 
 def inference():
-    MODEL_CHECKPOINT = "best_model.pth"
+    MODEL_CHECKPOINT = "best_model_efficientnet.pth"
     MAX_LENGTH = 100
 
     embed_dim = 256
@@ -689,10 +738,8 @@ def inference():
     print("Loaded model from", MODEL_CHECKPOINT)
     while True:
         IMAGE_PATH = input("Enter image path: ")
-        caption1, caption2, caption3 = generate_caption_for_image(IMAGE_PATH, model, tokenizer, device, MAX_LENGTH)
-        # print("Generated Caption (top-k):", caption1)
-        # print("Generated Caption (nucleus):", caption2)
-        print("Generated Caption (beam):", caption3)
+        caption = generate_caption_for_image(IMAGE_PATH, model, tokenizer, device, MAX_LENGTH)
+        print("Generated Caption (beam):", caption)
 
 if __name__ == "__main__":
     inference()

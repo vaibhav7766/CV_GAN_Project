@@ -8,7 +8,7 @@ from torch import nn, optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms, models
-from transformers import AutoTokenizer, BartTokenizer
+from transformers import BartTokenizer
 from PIL import Image
 from tqdm import tqdm
 import timm
@@ -643,10 +643,8 @@ def generate_caption_for_image(image_path, model, tokenizer, device, max_length)
     model.eval()
     with torch.no_grad():
         encoder_features = model.encoder(image)
-        # caption1 = top_k_sampling_decode(encoder_features, model, tokenizer, device, max_length=max_length)
-        # caption2 = nucleus_sampling_decode(encoder_features, model, tokenizer, device, max_length=max_length)
-        caption3 = beam_search_decode(encoder_features, model, tokenizer, device, max_length=max_length)
-    return "caption1", "caption2", caption3
+        caption = beam_search_decode(encoder_features, model, tokenizer, device, max_length=max_length)
+    return caption
 
 def inference():
     MODEL_CHECKPOINT = "best_model_deit.pth"
@@ -680,10 +678,8 @@ def inference():
 
     while True:
         IMAGE_PATH = input("Enter image path: ")
-        caption1, caption2, caption3 = generate_caption_for_image(IMAGE_PATH, model, tokenizer, device, MAX_LENGTH)
-        # print("top-k:", caption1)
-        # print("nucleus:", caption2)
-        print("beam:", caption3)
+        caption = generate_caption_for_image(IMAGE_PATH, model, tokenizer, device, MAX_LENGTH)
+        print("Generated Caption (beam):", caption)
 
 if __name__ == "__main__":
     inference()
