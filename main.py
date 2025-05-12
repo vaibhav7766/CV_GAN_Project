@@ -1,9 +1,11 @@
+import warnings
+warnings.filterwarnings("ignore")
+
 import os
 import csv
 import json
 import torch
 import numpy as np
-import intel_extension_for_pytorch as ipex
 from torch import nn, optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader, random_split
@@ -21,57 +23,6 @@ from pycocoevalcap.cider.cider import Cider
 
 
 # --- Dataset ---
-class CaptionDataset(Dataset):
-    def __init__(self, image_dir, captions_file, tokenizer, max_length,
-                use_features=False, features_dir=None):
-        self.image_dir = image_dir
-        self.data = []
-        with open(captions_file, 'r') as f:
-            data = json.load(f)
-        for img_name, captions in data.items():
-            for cap in captions:
-                self.data.append((img_name, cap)) 
-        
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.use_features = use_features
-        self.features_dir = features_dir
-        if features_dir is None:
-            self.use_features = False
-        
-        # Transformation is only used when loading raw images.
-        weights = EfficientNet_B4_Weights.IMAGENET1K_V1
-        self.transform = weights.transforms()
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        image_filename, caption = self.data[idx]
-        tokenized = self.tokenizer(
-            caption,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
-        tokenized_caption = {
-            "input_ids": tokenized.input_ids.squeeze(), 
-            "attention_mask": tokenized.attention_mask.squeeze()
-        }
-        
-        if self.use_features:
-            feature_path = os.path.join(self.features_dir, os.path.splitext(image_filename)[0] + ".pt")
-            features = torch.load(feature_path, weights_only=True)
-            return features, tokenized_caption["input_ids"], tokenized_caption["attention_mask"]
-        else:
-            image_path = os.path.join(self.image_dir, image_filename)
-            image = Image.open(image_path).convert("RGB")
-            image = self.transform(image)
-            return image, tokenized_caption["input_ids"], tokenized_caption["attention_mask"]
-
-
-# --- Merged Dataset ---
 class ImageCaptionDataset(Dataset):
     def __init__(self, image_dir, captions_file, tokenizer, max_length,
                 model_name, use_features=False, features_dir=None):
@@ -627,72 +578,7 @@ class ImageCaptionTrainer:
         }
 
 
-def precompute_features(dataset, encoder, device, save_dir, batch_size=32):
-    encoder.eval()
-    encoder.to(device)
-    os.makedirs(save_dir, exist_ok=True)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, pin_memory=True, persistent_workers=True, num_workers=4)
-    idx = 0
-    with torch.no_grad():
-        for images, _, _ in tqdm(loader, desc="Precomputing features"):
-            images = images.to(device)
-            features = encoder(images)
-            for feature in features:
-                filename = dataset.image_filenames[idx]
-                name, _ = filename.split(".")
-                feature_path = os.path.join(save_dir, f"{name}.pt")
-                torch.save(feature.cpu(), feature_path)
-                idx += 1
-
-
 # --- Inference function ---
-def top_k_sampling_decode(encoder_features, model, tokenizer, device, max_length, k=50):
-    start_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.pad_token_id
-    eos_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.pad_token_id
-    
-    generated = torch.tensor([start_token_id], device=device).unsqueeze(0)
-    model.eval()
-    with torch.no_grad():
-        for _ in range(max_length - 1):
-            outputs = model.decoder(encoder_features, generated)
-            next_token_logits = outputs[:, -1, :]
-            # Get top-k tokens
-            topk_logits, topk_indices = torch.topk(next_token_logits, k, dim=-1)
-            probs = torch.softmax(topk_logits, dim=-1)
-            # Sample from the top-k tokens
-            next_token = topk_indices.gather(-1, torch.multinomial(probs, num_samples=1))
-            generated = torch.cat([generated, next_token], dim=1)
-            if next_token.item() == eos_token_id:
-                break
-    caption = tokenizer.decode(generated.squeeze(), skip_special_tokens=True)
-    return caption
-
-def nucleus_sampling_decode(encoder_features, model, tokenizer, device, max_length, p=0.9):
-    start_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.pad_token_id
-    eos_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.pad_token_id
-    
-    generated = torch.tensor([start_token_id], device=device).unsqueeze(0)
-    model.eval()
-    with torch.no_grad():
-        for _ in range(max_length - 1):
-            outputs = model.decoder(encoder_features, generated)
-            next_token_logits = outputs[:, -1, :]
-            probs = torch.softmax(next_token_logits, dim=-1)
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-            # Remove tokens with cumulative probability above p
-            sorted_indices_to_remove = cumulative_probs > p
-            # Ensure at least one token is kept
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-            next_token_logits[0, sorted_indices[sorted_indices_to_remove]] = -float('Inf')
-            next_token = next_token_logits.argmax(dim=-1, keepdim=True)
-            generated = torch.cat([generated, next_token], dim=1)
-            if next_token.item() == eos_token_id:
-                break
-    caption = tokenizer.decode(generated.squeeze(), skip_special_tokens=True)
-    return caption
-
 def beam_search_decode(encoder_features, model, tokenizer, device, max_length, beam_width=3, length_penalty=0.7, repetition_penalty=1.2):
     start_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.pad_token_id
     eos_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.pad_token_id
@@ -730,7 +616,6 @@ def beam_search_decode(encoder_features, model, tokenizer, device, max_length, b
     best_sequence = beams[0][0]
     caption = tokenizer.decode(best_sequence, skip_special_tokens=True)
     return caption
-
 
 def process_image(image_path, model_name):
     if model_name == "efficientnet":
@@ -804,7 +689,7 @@ def inference_deit():
     num_layers = 4
     dropout = 0.2
     feature_dim = 768
-    num_image_tokens = 197
+    num_image_tokens = 196
     
     device = "cpu"
     tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
@@ -851,4 +736,78 @@ def inference():
             continue
 
 if __name__ == "__main__":
-    inference()
+    # --- Device Setup ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # --- Paths, Tokenizer, Dataset, and DataLoader ---
+    IMAGE_DIR = "train2017"
+    CAPTIONS_FILE = "merged_captions.json"
+    tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
+    max_length = 100
+
+    dataset = ImageCaptionDataset(IMAGE_DIR, CAPTIONS_FILE, tokenizer, max_length=max_length, model_name="deit")
+    print(f"Dataset size: {len(dataset)}")
+
+    # --- Create Train, Validation, and Test Splits ---
+    batch_size = 32
+    total_size = len(dataset)
+    train_size = int(0.8 * total_size)
+    val_size = int(0.1 * total_size)
+    test_size = total_size - train_size - val_size
+    train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, persistent_workers=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, persistent_workers=True, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, persistent_workers=True, num_workers=4)
+
+    # --- Hyperparameters ---
+    embed_dim = 768 # 256
+    num_heads = 4
+    hidden_dim = 1024
+    num_layers = 4
+    dropout = 0.2
+    feature_dim = 768 # 1792
+    num_image_tokens = 197 # 49
+    lr = 1e-4
+    weight_decay = 1e-4
+
+
+    # --- Instantiate Encoder, Decoder, and Model ---
+    encoder = DeiTEncoder()
+    decoder = TransformerDecoder(
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        hidden_dim=hidden_dim,
+        vocab_size=tokenizer.vocab_size,
+        num_layers=num_layers,
+        max_length=max_length,
+        feature_dim=feature_dim,
+        num_image_tokens=num_image_tokens,
+        dropout=dropout,
+    )
+    model = ImageCaptionModel(encoder, decoder)
+
+    # --- Loss, Optimizer, Scheduler and Training ---
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+    num_epochs = 50
+
+    model.train()
+    model = model.to(device)
+    criterion = criterion.to(device)
+    trainer = ImageCaptionTrainer(model, tokenizer, criterion, optimizer, scheduler, device)
+    trainer.train(train_loader, val_loader, num_epochs, patience=5, min_delta=0.001, max_length=max_length)
+
+    model.load_state_dict(torch.load("best_model.pth", weights_only=True, map_location=device))
+    trainer.model = model
+
+    # --- After Training, Evaluate on the Test Set (Greedy Decoding) ---
+    all_hypotheses, all_references, bleu_hypotheses, bleu_references = trainer.evaluate_test_set(test_loader, max_length)
+
+    metrics = trainer.compute_metrics(all_hypotheses, all_references, bleu_hypotheses, bleu_references)
+    for metric, value in metrics.items():
+        print(f"{metric}: {value:.4f}")
+    
+    with open("metrics.json", "w") as f:
+        json.dump(metrics, f, indent=4)
